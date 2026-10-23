@@ -595,8 +595,20 @@ def hole_data(c):
         if np.hypot(*(gc - L[-1])) > 40:
             gc = L[-1]
         h["green"] = gc
-        h["aims"] = [q for q in L[1:-1]][:2]
-        rest = np.vstack(h["aims"] + [gc])
+        mid = [q for q in L[1:-1]]
+        h["path"] = mid                                  # every bend of the mapped hole line (yardages follow all of them)
+        if len(mid) > 2:                                 # GSPro takes two aim points: keep the sharpest bends
+            pts = [L[0]] + mid + [gc]
+            turn = []
+            for k in range(1, len(pts) - 1):
+                v1, v2 = pts[k] - pts[k - 1], pts[k + 1] - pts[k]
+                cosang = np.dot(v1, v2) / max(np.hypot(*v1) * np.hypot(*v2), 1e-6)
+                turn.append((np.arccos(np.clip(cosang, -1, 1)), k - 1))
+            keep = sorted(k for _, k in sorted(turn, reverse=True)[:2])
+            h["aims"] = [mid[k] for k in keep]
+        else:
+            h["aims"] = mid
+        rest = np.vstack(mid + [gc])
         boxes = []
         for j, tp in enumerate(tees):
             if owner[j] == i and np.hypot(*(tp - L[0])) < 150:
@@ -655,6 +667,61 @@ def read_card(path):
     return card
 
 
+def fairway_aims(c, holes, pars):
+    """Aim points at the centre of the widest part of the fairway: par 4 in the drive zone (190-290 yds from the
+    back of the hole), par 5 one in the drive zone and one in the lay-up zone. Uses the Fairway layer of course.svg."""
+    if not os.path.exists("course.svg"):
+        return {}
+    from PIL import Image, ImageDraw
+    S = int(c["size"])
+    svg = open("course.svg").read()
+    i0 = svg.find('inkscape:label="Fairway"')
+    if i0 < 0:
+        return {}
+    block = svg[i0:svg.find("</g>", i0)]
+    fw = np.zeros((S, S), bool)
+    for d in re.findall(r' d="([^"]+)"', block):
+        for sp in re.split(r"(?=M )", d.strip()):
+            pts = [tuple(float(v) for v in q.split(",")) for q in re.findall(r"(-?\d+\.?\d*,-?\d+\.?\d*)", sp)]
+            if len(pts) > 2:
+                im = Image.new("L", (S, S), 0); ImageDraw.Draw(im).polygon(pts, fill=255)
+                fw ^= np.asarray(im) > 0
+    fw = np.flipud(fw)                                    # row 0 = south, like the other grids
+    half_width = ndimage.distance_transform_edt(fw)       # metres to the fairway edge
+    yy, xx = np.mgrid[0:S, 0:S] + 0.5
+    out = {}
+    for h in holes:
+        par = pars[h["hole"] - 1] if h["hole"] and h["hole"] <= len(pars) else 0
+        if par < 4:
+            continue
+        L = np.vstack([h["line"][:-1], h["green"]])
+        seg_len = np.hypot(*np.diff(L, axis=0).T); total = seg_len.sum()
+        # along-hole distance and distance-from-line of every fairway pixel near this hole
+        best_s = np.full((S, S), np.nan, np.float32); best_d = np.full((S, S), 1e9, np.float32)
+        start = 0.0
+        for (ax, az), (bx, bz), sl in zip(L[:-1], L[1:], seg_len):
+            dx, dz = bx - ax, bz - az
+            t = np.clip(((xx - ax) * dx + (yy - az) * dz) / max(sl * sl, 1e-9), 0, 1)
+            dd = np.hypot(xx - ax - t * dx, yy - az - t * dz)
+            closer = dd < best_d
+            best_d = np.where(closer, dd, best_d); best_s = np.where(closer, start + t * sl, best_s)
+            start += sl
+        near = fw & (best_d < 40)
+        yd = best_s / 0.9144; to_green = (total - best_s) / 0.9144
+        zones = [(190, 290)] if par == 4 else [(190, 290), (330, 450)]
+        aims = []
+        for lo, hi in zones:
+            z = near & (yd >= lo) & (yd <= hi) & (to_green >= 70)
+            if not z.any():
+                continue
+            k = np.argmax(np.where(z, half_width, -1))
+            r, q = np.unravel_index(k, z.shape)
+            aims.append(np.array([q + 0.5, r + 0.5]))
+        if aims:
+            out[h["hole"]] = aims
+    return out
+
+
 def cmd_card(a):
     c = load_cfg()
     if not os.path.exists("card.csv"):
@@ -682,7 +749,7 @@ def cmd_card(a):
             pins.setdefault(int(row["hole"]), {})[row["label"].strip().lower()] = np.array([e - c["sw_e"], n - c["sw_n"]])
         print("Using hand-placed tees from tee_pins.csv for holes", sorted(pins))
     def yards_from(h, tp):
-        route = np.vstack([tp] + h["aims"] + [h["green"]])
+        route = np.vstack([tp] + h["path"] + [h["green"]])
         return float(np.sum(np.hypot(*np.diff(route, axis=0).T)) / 0.9144)
     report, need = [], 0
     assign = {}
@@ -744,6 +811,11 @@ def cmd_card(a):
         d[slots[t_["name"]].replace("Par3", "PAR3") + "SR"] = t_["sr"]
     pars = card.get("par") or [int(byn[i]["par"] or 0) if i in byn else 0 for i in range(1, 19)]
     d["CoursePar"] = int(sum(pars))
+    fa = fairway_aims(c, holes, pars)
+    if fa:
+        for hn, aims in fa.items():
+            byn[hn]["aims"] = aims
+        print("Aim points: widest part of the fairway on %d holes (from course.svg); the rest follow the hole line." % len(fa))
     totals = {s_: 0.0 for s_ in GSP_SLOTS}
     new_holes = []
     days = ["Thursday", "Friday", "Saturday", "Sunday"]
@@ -758,7 +830,7 @@ def cmd_card(a):
             got = assign.get((hn, names[0])) if names else None
             if got:
                 tp = got[0]
-                route = np.vstack([tp] + aims + [gc])
+                route = np.vstack([tp] + (h["path"] if h else []) + [gc])
                 dist = float(np.sum(np.hypot(*np.diff(route, axis=0).T)))
                 totals[slot] += dist
                 hole["Tees"].append({"TeeType": slot, "Enabled": True, "Distance": round(dist, 3), "Position": P(tp)})
