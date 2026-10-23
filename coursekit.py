@@ -566,7 +566,7 @@ def hole_data(c):
     for nd in root.iter("node"):
         e, n = t.transform(float(nd.get("lon")), float(nd.get("lat")))
         nodes[nd.get("id")] = (e - c["sw_e"], n - c["sw_n"])
-    holes, greens, tees = [], [], []
+    holes, greens, tees, tee_polys = [], [], [], []
     for w in root.findall("way"):
         tg = {q.get("k"): q.get("v") for q in w.findall("tag")}
         p = np.array([nodes[q.get("ref")] for q in w.findall("nd") if q.get("ref") in nodes])
@@ -580,7 +580,7 @@ def hole_data(c):
         elif g == "green" and cen is not None:
             greens.append(cen)
         elif g == "tee" and cen is not None:
-            tees.append(cen)
+            tees.append(cen); tee_polys.append(p)
     if not holes:
         sys.exit("No golf=hole lines in map.osm, so holes can't be worked out automatically.")
     greens, tees = np.array(greens).reshape(-1, 2), np.array(tees).reshape(-1, 2)
@@ -601,7 +601,13 @@ def hole_data(c):
         for j, tp in enumerate(tees):
             if owner[j] == i and np.hypot(*(tp - L[0])) < 150:
                 route = np.vstack([tp, rest])
-                boxes.append((float(np.sum(np.hypot(*np.diff(route, axis=0).T)) / 0.9144), tp))
+                # the box's usable length along the line of play: markers move up and back within one box
+                u = rest[0] - tp; u = u / max(np.hypot(*u), 1e-6)
+                sproj = (tee_polys[j] - tp) @ u
+                lo, hi = sproj.min() + 1.5, sproj.max() - 1.5
+                if hi < lo:
+                    lo = hi = 0.0
+                boxes.append((float(np.sum(np.hypot(*np.diff(route, axis=0).T)) / 0.9144), tp, tp + u * lo, tp + u * hi))
         h["boxes"] = sorted(boxes, key=lambda b: -b[0])
     unused = sum(1 for j in range(len(tees)) if np.hypot(*(tees[j] - starts[owner[j]])) >= 150)
     return sorted(holes, key=lambda h: h["hole"]), yv, unused
@@ -618,8 +624,8 @@ def cmd_holes(a):
     with open("tees.csv", "w", newline="") as f:
         w = csv.writer(f); w.writerow(["hole", "box", "x", "z", "y", "yards"])
         for h in holes:
-            for k, (yd, tp) in enumerate(h["boxes"]):
-                w.writerow([h["hole"], k + 1, "%.2f" % tp[0], "%.2f" % tp[1], "%.2f" % yv(tp), "%.0f" % yd])
+            for k, b in enumerate(h["boxes"]):
+                w.writerow([h["hole"], k + 1, "%.2f" % b[1][0], "%.2f" % b[1][1], "%.2f" % yv(b[1]), "%.0f" % b[0]])
     print("%-4s %-4s %-4s %-6s %s" % ("hole", "par", "hcp", "boxes", "yards (back to front, along the mapped hole line)"))
     for h in holes:
         print("%-4s %-4s %-4s %-6s %s" % (h["hole"], h["par"] or "?", h["hcp"] or "?", len(h["boxes"]), " / ".join("%.0f" % b[0] for b in h["boxes"])))
@@ -664,16 +670,54 @@ def cmd_card(a):
             sys.exit("Don't know which GSPro tee slot '%s' should use; pass --map %s=Blue (for example)." % (t_["name"], t_["name"]))
         slots[t_["name"]] = slot
     print("Tee colours -> GSPro slots:", ", ".join("%s->%s" % kv for kv in slots.items()))
+    # Each colour goes to the spot inside a mapped tee box whose yardage best matches the card (markers move up and
+    # back within a long box). Hand-placed tees override that: tee_pins.csv  hole,label,lat,lon
+    # (label = a card colour, or back/front of a long box that isn't mapped)
+    pins = {}
+    if os.path.exists("tee_pins.csv"):
+        from pyproj import Transformer
+        tr = Transformer.from_crs("EPSG:4326", "EPSG:%d" % c["epsg"], always_xy=True)
+        for row in csv.DictReader(open("tee_pins.csv")):
+            e, n = tr.transform(float(row["lon"]), float(row["lat"]))
+            pins.setdefault(int(row["hole"]), {})[row["label"].strip().lower()] = np.array([e - c["sw_e"], n - c["sw_n"]])
+        print("Using hand-placed tees from tee_pins.csv for holes", sorted(pins))
+    def yards_from(h, tp):
+        route = np.vstack([tp] + h["aims"] + [h["green"]])
+        return float(np.sum(np.hypot(*np.diff(route, axis=0).T)) / 0.9144)
     report, need = [], 0
     assign = {}
     for hn in range(1, 19):
         h = byn.get(hn)
         line = "%2d: " % hn
+        hp = pins.get(hn, {})
         for t_ in card["tees"]:
             want = t_["yards"][hn - 1]
+            if h is not None and t_["name"].lower() in hp:
+                tp = hp[t_["name"].lower()]; yd = yards_from(h, tp)
+                assign[(hn, t_["name"])] = (tp, yd)
+                line += "%s %d=%.0f(pin)  " % (t_["name"], want, yd)
+                continue
+            if h is not None and "back" in hp and "front" in hp:
+                b_, f_ = hp["back"], hp["front"]; yb, yf = yards_from(h, b_), yards_from(h, f_)
+                k = float(np.clip((yb - want) / (yb - yf), 0, 1)) if yb != yf else 0.0
+                tp = b_ + (f_ - b_) * k; yd = yards_from(h, tp)
+                flag = "" if abs(yd - want) <= max(12, 0.06 * want) else " <-CHECK"
+                need += bool(flag)
+                assign[(hn, t_["name"])] = (tp, yd)
+                line += "%s %d=%.0f(box)%s  " % (t_["name"], want, yd, flag)
+                continue
             if h is None or not h["boxes"]:
                 line += "%s %d ?  " % (t_["name"], want); need += 1; continue
-            yd, tp = min(h["boxes"], key=lambda b: abs(b[0] - want))
+            best = None
+            for b in h["boxes"]:
+                back, front = b[2], b[3]
+                yb, yf = yards_from(h, back), yards_from(h, front)
+                k = float(np.clip((yb - want) / (yb - yf), 0, 1)) if abs(yb - yf) > 0.5 else 0.0
+                p_ = back + (front - back) * k
+                y_ = yards_from(h, p_)
+                if best is None or abs(y_ - want) < abs(best[0] - want):
+                    best = (y_, p_)
+            yd, tp = best
             off = yd - want
             flag = "" if abs(off) <= max(12, 0.06 * want) else " <-CHECK"
             if flag:
