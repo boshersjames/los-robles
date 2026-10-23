@@ -11,6 +11,7 @@ Each course lives in its own folder with a course.json. Run every step from insi
   python coursekit.py trees  [--buffer 150]       trees from LiDAR                 -> trees.csv, trees_on_satellite.png
   python coursekit.py brush  [--buffer 200]       brush / chaparral from LiDAR     -> shrubs.csv, brush_mask.png, brush_on_satellite.png
   python coursekit.py osm                         what map.osm has + cart paths    -> cartpaths.csv, osm_on_satellite.png
+  python coursekit.py svg                         OPCD course drawing (draft)      -> course.svg, course_svg_preview.png
 
 "Near the holes" filters use golf=hole lines from map.osm in the course folder (OpenStreetMap export),
 or a Greenkeeper file (--gkd), or nothing (--buffer 0).
@@ -554,6 +555,143 @@ def cmd_osm(a):
         pass
 
 
+SVG_LAYERS = [("Rough", "rough", "#278438"), ("Deep", "deep", "#164B20"), ("Fairway", "fairway", "#43E561"),
+              ("Tee", "tee", "#A0E5B8"), ("Green", "green", "#BCE5A4"), ("Bunker", "bunker", "#E5E5AA"), ("Water", "water", "#0000C0")]
+
+
+def cmd_svg(a):
+    """Draft OPCD SVG: greens/tees/bunkers/water from OSM, fairways from OSM or detected from the photo,
+    deep rough from the brush mask, rough = the rest of the course. Image coords: x east, y = size - north (metres)."""
+    from PIL import Image, ImageDraw
+    from pyproj import Transformer
+    try:
+        from skimage import measure
+    except ImportError:
+        sys.exit("Needs scikit-image:  ~/venv/bin/python -m pip install scikit-image")
+    c = load_cfg(); S = int(c["size"]); R = a.res; N = int(S / R)
+    if not os.path.exists("map.osm") or not os.path.exists("satellite.jpg"):
+        sys.exit("Needs map.osm and satellite.jpg in this folder.")
+    t = Transformer.from_crs("EPSG:4326", "EPSG:%d" % c["epsg"], always_xy=True)
+    root = ET.parse("map.osm").getroot()
+    nodes = {}
+    for nd in root.iter("node"):
+        e, n = t.transform(float(nd.get("lon")), float(nd.get("lat")))
+        nodes[nd.get("id")] = ((e - c["sw_e"]) / R, (S - (n - c["sw_n"])) / R)
+    names = ("green", "tee", "bunker", "water", "fairway", "line", "course", "exclude")
+    imgs = {k: Image.new("L", (N, N), 0) for k in names}
+    drw = {k: ImageDraw.Draw(v) for k, v in imgs.items()}
+    road_w = {"motorway": 30, "motorway_link": 14, "trunk": 24, "primary": 20, "secondary": 16, "tertiary": 12, "residential": 10, "service": 6}
+    for w in root.findall("way"):
+        tg = {q.get("k"): q.get("v") for q in w.findall("tag")}
+        p = [nodes[q.get("ref")] for q in w.findall("nd") if q.get("ref") in nodes]
+        if len(p) < 2:
+            continue
+        g = tg.get("golf")
+        poly = len(p) > 2
+        if g == "hole":
+            drw["line"].line(p, fill=255, width=max(1, int(1 / R)))
+        elif g in ("green", "tee", "bunker", "fairway") and poly:
+            drw[g].polygon(p, fill=255)
+        elif (g in ("water_hazard", "lateral_water_hazard") or tg.get("natural") == "water") and poly:
+            drw["water"].polygon(p, fill=255)
+        elif tg.get("leisure") == "golf_course" and poly:
+            drw["course"].polygon(p, fill=255)
+        elif ("building" in tg or tg.get("amenity") == "parking" or tg.get("landuse") in ("residential", "commercial", "retail", "industrial")) and poly:
+            drw["exclude"].polygon(p, fill=255)
+        elif tg.get("highway") in road_w and g != "cartpath":
+            drw["exclude"].line(p, fill=255, width=int(road_w[tg["highway"]] / R))
+    M = {k: np.asarray(v) > 0 for k, v in imgs.items()}
+    line_dist = ndimage.distance_transform_edt(~M["line"]) * R
+    feats = M["green"] | M["tee"] | M["bunker"] | M["water"]
+
+    # course area: mapped boundary if it holds the holes, else a corridor around holes and features
+    course = M["course"]
+    if not course.any() or course[M["line"]].mean() < 0.6:
+        course = (line_dist < a.corridor) | (ndimage.distance_transform_edt(~(feats | M["fairway"])) * R < 20)
+        print("Course area: %d m around the hole lines (no usable golf_course boundary in map.osm)" % a.corridor)
+    else:
+        print("Course area: mapped golf_course boundary")
+    course &= ~M["exclude"]
+
+    # fairways: use OSM where a hole has one, otherwise detect smooth bright turf along the hole line
+    sat = np.asarray(Image.open("satellite.jpg").convert("RGB").resize((N, N), Image.BILINEAR), dtype=np.float32)
+    lum = sat.mean(2); gr = sat[..., 1] / np.maximum(sat.sum(2), 1)
+    k = max(3, int(round(7 / R)) | 1)
+    tex = np.sqrt(np.maximum(ndimage.uniform_filter(lum ** 2, k) - ndimage.uniform_filter(lum, k) ** 2, 0))
+    grs = ndimage.uniform_filter(gr, k)
+    it = max(1, int(round(3 / R)))
+    cand = (tex < a.smooth) & (grs >= a.min_green) & (line_dist < a.fw_corridor) & ~ndimage.binary_dilation(feats, iterations=max(1, int(1 / R)))
+    cand = ndimage.binary_closing(ndimage.binary_opening(cand, iterations=it), iterations=it)
+    lab, _ = ndimage.label(cand)
+    det = np.isin(lab, np.unique(lab[(line_dist < 18) & (lab > 0)])) & (lab > 0)
+    det = ndimage.binary_fill_holes(ndimage.binary_closing(det, iterations=int(round(5 / R))))
+    osm_fw = M["fairway"]
+    if osm_fw.any():
+        flab, _ = ndimage.label(det)
+        covered = np.unique(flab[ndimage.binary_dilation(osm_fw, iterations=int(10 / R)) & (flab > 0)])
+        det &= ~np.isin(flab, covered)              # drop detections where OSM already has a fairway
+    fairway = (osm_fw | det) & course
+    print("Fairways: %.1f ha from OSM, %.1f ha detected from the photo (draft - check in Inkscape)" % (osm_fw.sum() * R * R / 1e4, (det & course).sum() * R * R / 1e4))
+
+    deep = np.zeros_like(fairway)
+    if os.path.exists("brush_mask.png"):
+        bm = np.asarray(Image.open("brush_mask.png").convert("L").resize((N, N), Image.NEAREST)) > 0   # stored north-up
+        deep = bm & course
+    # one class per pixel, highest priority wins
+    label = np.zeros((N, N), np.uint8)
+    for code, m in ((1, course), (2, deep), (3, fairway), (4, M["tee"]), (5, M["green"]), (6, M["bunker"]), (7, M["water"])):
+        label[m] = code
+    near_course = ndimage.binary_dilation(course, iterations=int(round(25 / R)))
+    label[~course & ~feats] = 0
+    label[~near_course] = 0          # ignore greens/tees/bunkers/water mapped outside the course (creeks, other facilities)
+
+    out = ['<?xml version="1.0" encoding="UTF-8" standalone="no"?>',
+           '<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" '
+           'xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd" width="%dmm" height="%dmm" viewBox="0 0 %d %d" version="1.1">' % (S, S, S, S)]
+    counts = {}
+    for code, (title, pid, col) in enumerate(SVG_LAYERS, start=1):
+        out.append('<g inkscape:groupmode="layer" id="layer_%s" inkscape:label="%s">' % (pid, title))
+        m = label == code
+        m = ndimage.binary_opening(m, iterations=1) if code in (1, 2, 3) else m
+        comp, n = ndimage.label(m)
+        sl = ndimage.find_objects(comp)
+        idx = 0
+        for i, s_ in enumerate(sl, start=1):
+            if s_ is None:
+                continue
+            sub = np.pad((comp[s_] == i).astype(float), 1)
+            if sub.sum() * R * R < (max(a.min_area, 150) if code in (2, 3) else a.min_area):
+                continue
+            loops = []
+            for cont in measure.find_contours(sub, 0.5):
+                cont = measure.approximate_polygon(cont, tolerance=a.simplify / R)
+                if len(cont) < 4:
+                    continue
+                ys = (cont[:, 0] - 1 + s_[0].start + 0.5) * R
+                xs = (cont[:, 1] - 1 + s_[1].start + 0.5) * R
+                loops.append("M " + " L ".join("%.3f,%.3f" % (x, y) for x, y in zip(xs, ys)) + " Z")
+            if loops:
+                out.append('<path id="%s_%d" style="fill:%s;fill-opacity:1;fill-rule:evenodd;stroke:none" d="%s"/>' % (pid, idx, col, " ".join(loops)))
+                idx += 1
+        counts[title] = idx
+        out.append("</g>")
+    out.append("</svg>")
+    open("course.svg", "w").write("\n".join(out))
+    print("Wrote course.svg:", ", ".join("%s %d" % kv for kv in counts.items()))
+    print("Areas (ha):", ", ".join("%s %.1f" % (t_, (label == i).sum() * R * R / 1e4) for i, (t_, _, _) in enumerate(SVG_LAYERS, start=1)))
+
+    try:
+        cols = np.array([[0, 0, 0, 0]] + [[int(cl[1:3], 16), int(cl[3:5], 16), int(cl[5:7], 16), 150] for _, _, cl in SVG_LAYERS], np.uint8)
+        ov = Image.fromarray(cols[label], "RGBA")
+        base = Image.open("satellite.jpg").convert("RGBA").resize((N, N))
+        prev = Image.alpha_composite(base, ov)
+        prev.thumbnail((2000, 2000))
+        prev.save("course_svg_preview.png")
+        print("Wrote course_svg_preview.png")
+    except Exception as e:
+        print("(preview skipped: %s)" % e)
+
+
 # ---------------------------------------------------------------- cli
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -571,8 +709,15 @@ def main():
     p.add_argument("--spacing", type=float, default=3.0); p.add_argument("--buffer", type=float, default=200); p.add_argument("--gkd")
     p.add_argument("--course-margin", type=float, default=60, help="metres beyond the mapped course boundary to keep (-1 = ignore boundary)")
     p = sp.add_parser("osm"); p.add_argument("--paths-fallback", action="store_true", help="use footpaths if no golf=cartpath")
+    p = sp.add_parser("svg"); p.add_argument("--res", type=float, default=0.5, help="metres per pixel when tracing")
+    p.add_argument("--corridor", type=float, default=60, help="course width around hole lines if no boundary is mapped")
+    p.add_argument("--fw-corridor", type=float, default=38, help="max distance of detected fairway from the hole line")
+    p.add_argument("--smooth", type=float, default=5.5, help="max photo texture for mown fairway (higher = more)")
+    p.add_argument("--min-green", type=float, default=0.37, help="min green share of RGB for fairway")
+    p.add_argument("--min-area", type=float, default=25, help="drop pieces smaller than this (m2)")
+    p.add_argument("--simplify", type=float, default=0.15, help="outline simplification (m)")
     a = ap.parse_args()
-    {"osm": cmd_osm, "new": cmd_new, "lidar": cmd_lidar, "satellite": cmd_satellite, "heightmap": cmd_heightmap,
+    {"svg": cmd_svg, "osm": cmd_osm, "new": cmd_new, "lidar": cmd_lidar, "satellite": cmd_satellite, "heightmap": cmd_heightmap,
      "trees": cmd_trees, "brush": cmd_brush}[a.cmd](a)
 
 
