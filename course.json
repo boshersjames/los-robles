@@ -1,0 +1,14 @@
+{
+  "name": "LosRobles",
+  "center_lat": 34.17833,
+  "center_lon": -118.883899,
+  "size": 2000,
+  "epsg": 6340,
+  "arcgis_wkid": 26911,
+  "utm_zone": 11,
+  "sw_e": 325378.77,
+  "sw_n": 3782532.98,
+  "y_offset": 184.0,
+  "lidar_survey": "CA_SoCAL_Wildfires_2018_D18",
+  "terrain_height": 149.0
+}
