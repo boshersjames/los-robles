@@ -12,6 +12,7 @@ Each course lives in its own folder with a course.json. Run every step from insi
   python coursekit.py brush  [--buffer 200]       brush / chaparral from LiDAR     -> shrubs.csv, brush_mask.png, brush_on_satellite.png
   python coursekit.py osm                         what map.osm has + cart paths    -> cartpaths.csv, osm_on_satellite.png
   python coursekit.py svg                         OPCD course drawing (draft)      -> course.svg, course_svg_preview.png
+  python coursekit.py holes                       holes, greens, tee boxes + yards -> holes.csv, tees.csv, holes_on_satellite.png
 
 "Near the holes" filters use golf=hole lines from map.osm in the course folder (OpenStreetMap export),
 or a Greenkeeper file (--gkd), or nothing (--buffer 0).
@@ -555,6 +556,186 @@ def cmd_osm(a):
         pass
 
 
+def hole_data(c):
+    """From map.osm: per hole par/handicap tags, hole line, green centre and its tee boxes (yards back to front)."""
+    from pyproj import Transformer
+    yo = need_offset(c); S = int(c["size"])
+    t = Transformer.from_crs("EPSG:4326", "EPSG:%d" % c["epsg"], always_xy=True)
+    root = ET.parse("map.osm").getroot()
+    nodes = {}
+    for nd in root.iter("node"):
+        e, n = t.transform(float(nd.get("lon")), float(nd.get("lat")))
+        nodes[nd.get("id")] = (e - c["sw_e"], n - c["sw_n"])
+    holes, greens, tees = [], [], []
+    for w in root.findall("way"):
+        tg = {q.get("k"): q.get("v") for q in w.findall("tag")}
+        p = np.array([nodes[q.get("ref")] for q in w.findall("nd") if q.get("ref") in nodes])
+        if len(p) < 2:
+            continue
+        g = tg.get("golf")
+        cen = (p[:-1].mean(0) if (p[0] == p[-1]).all() else p.mean(0)) if len(p) > 2 else None
+        if g == "hole":
+            num = int(re.sub(r"\D", "", tg.get("ref", "")) or 0)
+            holes.append({"hole": num, "par": tg.get("par", ""), "hcp": tg.get("handicap", ""), "line": p})
+        elif g == "green" and cen is not None:
+            greens.append(cen)
+        elif g == "tee" and cen is not None:
+            tees.append(cen)
+    if not holes:
+        sys.exit("No golf=hole lines in map.osm, so holes can't be worked out automatically.")
+    greens, tees = np.array(greens).reshape(-1, 2), np.array(tees).reshape(-1, 2)
+    x, n, z, cl = load_points(); g2 = cl == 2
+    dtm = fill(cell_grid(np.clip(x[g2].astype(int), 0, S - 1), np.clip(n[g2].astype(int), 0, S - 1), z[g2], S, "mean"))
+    yv = lambda q: float(dtm[int(min(max(q[1], 0), S - 1)), int(min(max(q[0], 0), S - 1))] - yo)
+    starts = np.array([h["line"][0] for h in holes])
+    owner = [int(np.argmin(np.hypot(*(starts - tp).T))) for tp in tees]
+    for i, h in enumerate(holes):
+        L = h["line"]
+        gc = greens[np.argmin(np.hypot(*(greens - L[-1]).T))] if len(greens) else L[-1]
+        if np.hypot(*(gc - L[-1])) > 40:
+            gc = L[-1]
+        h["green"] = gc
+        h["aims"] = [q for q in L[1:-1]][:2]
+        rest = np.vstack(h["aims"] + [gc])
+        boxes = []
+        for j, tp in enumerate(tees):
+            if owner[j] == i and np.hypot(*(tp - L[0])) < 150:
+                route = np.vstack([tp, rest])
+                boxes.append((float(np.sum(np.hypot(*np.diff(route, axis=0).T)) / 0.9144), tp))
+        h["boxes"] = sorted(boxes, key=lambda b: -b[0])
+    unused = sum(1 for j in range(len(tees)) if np.hypot(*(tees[j] - starts[owner[j]])) >= 150)
+    return sorted(holes, key=lambda h: h["hole"]), yv, unused
+
+
+def cmd_holes(a):
+    c = load_cfg()
+    holes, yv, unused = hole_data(c)
+    with open("holes.csv", "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["hole", "par", "handicap", "green_x", "green_z", "green_y", "tee_boxes", "yards_back_to_front"])
+        for h in holes:
+            gc = h["green"]
+            w.writerow([h["hole"], h["par"], h["hcp"], "%.2f" % gc[0], "%.2f" % gc[1], "%.2f" % yv(gc), len(h["boxes"]), " / ".join("%.0f" % b[0] for b in h["boxes"])])
+    with open("tees.csv", "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["hole", "box", "x", "z", "y", "yards"])
+        for h in holes:
+            for k, (yd, tp) in enumerate(h["boxes"]):
+                w.writerow([h["hole"], k + 1, "%.2f" % tp[0], "%.2f" % tp[1], "%.2f" % yv(tp), "%.0f" % yd])
+    print("%-4s %-4s %-4s %-6s %s" % ("hole", "par", "hcp", "boxes", "yards (back to front, along the mapped hole line)"))
+    for h in holes:
+        print("%-4s %-4s %-4s %-6s %s" % (h["hole"], h["par"] or "?", h["hcp"] or "?", len(h["boxes"]), " / ".join("%.0f" % b[0] for b in h["boxes"])))
+    if unused:
+        print("(%d tee boxes weren't near any hole's start: practice tees or unlinked)" % unused)
+    print("Wrote holes.csv and tees.csv.")
+
+
+GSP_SLOTS = ["Black", "White", "Green", "Blue", "Yellow", "Red", "Junior", "Par3"]
+COLOR_ALIASES = {"gold": "Yellow", "yellow": "Yellow", "grey": "Green", "gray": "Green", "silver": "Green", "green": "Green",
+                 "black": "Black", "blue": "Blue", "white": "White", "red": "Red", "junior": "Junior", "orange": "Junior"}
+
+
+def read_card(path):
+    """card.csv rows: par / par_w / hcp / hcp_w, then one row per tee colour: name, 18 yardages, rating_m, slope_m[, rating_w, slope_w]."""
+    card = {"tees": []}
+    for row in csv.reader(open(path)):
+        if not row or not row[0].strip() or row[0].startswith("#"):
+            continue
+        key = row[0].strip()
+        vals = [v.strip() for v in row[1:]]
+        if key.lower() in ("par", "par_w", "hcp", "hcp_w"):
+            card[key.lower()] = [int(v) for v in vals[:18]]
+        elif key.lower() != "row":
+            card["tees"].append({"name": key, "yards": [int(v) for v in vals[:18]],
+                                 "sr": "%s/%s" % (vals[18], vals[19]) if len(vals) > 19 and vals[18] else "0.0/0"})
+    return card
+
+
+def cmd_card(a):
+    c = load_cfg()
+    if not os.path.exists("card.csv"):
+        sys.exit("No card.csv here (see coursekit docs for the format).")
+    card = read_card("card.csv")
+    holes, yv, _ = hole_data(c)
+    byn = {h["hole"]: h for h in holes}
+    slots = {}
+    for t_ in card["tees"]:
+        slot = a.map.get(t_["name"].lower()).title() if a.map and t_["name"].lower() in a.map else None
+        slot = slot or COLOR_ALIASES.get(t_["name"].lower())
+        if slot is None:
+            sys.exit("Don't know which GSPro tee slot '%s' should use; pass --map %s=Blue (for example)." % (t_["name"], t_["name"]))
+        slots[t_["name"]] = slot
+    print("Tee colours -> GSPro slots:", ", ".join("%s->%s" % kv for kv in slots.items()))
+    report, need = [], 0
+    assign = {}
+    for hn in range(1, 19):
+        h = byn.get(hn)
+        line = "%2d: " % hn
+        for t_ in card["tees"]:
+            want = t_["yards"][hn - 1]
+            if h is None or not h["boxes"]:
+                line += "%s %d ?  " % (t_["name"], want); need += 1; continue
+            yd, tp = min(h["boxes"], key=lambda b: abs(b[0] - want))
+            off = yd - want
+            flag = "" if abs(off) <= max(12, 0.06 * want) else " <-CHECK"
+            if flag:
+                need += 1
+            assign[(hn, t_["name"])] = (tp, yd)
+            line += "%s %d=%.0f%s  " % (t_["name"], want, yd, flag)
+        report.append(line)
+    print("\n".join(report))
+    print("%d tee placements look off (no box within ~6%% of the card); pin those boxes like at Tierra Rejada." % need if need else "Every card yardage matched a mapped tee box.")
+
+    tpl_path = a.template or os.path.expanduser("~/Tierra/greenkeeper/TierraRejada.GKD")
+    if not os.path.exists(tpl_path):
+        print("No template GKD at %s, so no GKD written (pass --template path/to/any.GKD)." % tpl_path)
+        return
+    d = json.load(open(tpl_path, encoding="utf-8-sig"))
+    P = lambda q: {"x": round(float(q[0]), 3), "y": round(yv(q), 3), "z": round(float(q[1]), 3)}
+    d.update({"SceneFolderName": c["name"], "CourseName": a.name or c["name"], "CourseLat": c["center_lat"], "CourseLong": c["center_lon"],
+              "Location": "", "CityTown": "", "StateCountyProvince": "", "Country": "", "Designer": "", "Homage": "",
+              "CourseInfo": "", "CourseImageFileName": "", "HasAlternateLayouts": False, "BenchMarkComplete": False,
+              "hazardCount": 0, "Hazards": [], "teeTypeCount": len(card["tees"])})
+    for slot in GSP_SLOTS:
+        d[slot.replace("Par3", "PAR3") + "SR"] = "0.0/0"
+    for t_ in card["tees"]:
+        d[slots[t_["name"]].replace("Par3", "PAR3") + "SR"] = t_["sr"]
+    pars = card.get("par") or [int(byn[i]["par"] or 0) if i in byn else 0 for i in range(1, 19)]
+    d["CoursePar"] = int(sum(pars))
+    totals = {s_: 0.0 for s_ in GSP_SLOTS}
+    new_holes = []
+    days = ["Thursday", "Friday", "Saturday", "Sunday"]
+    offsets = [(0, 0), (4, 3), (-4, 3), (3, -4)]
+    for hn in range(1, 19):
+        h = byn.get(hn)
+        hole = {"Enabled": True, "HoleNumber": hn, "Par": pars[hn - 1], "Index": (card.get("hcp") or [0] * 18)[hn - 1], "Tees": [], "Pins": []}
+        gc = h["green"] if h else np.array([0.0, 0.0])
+        aims = h["aims"] if h and pars[hn - 1] > 3 else []
+        for slot in GSP_SLOTS:
+            names = [n_ for n_, s_ in slots.items() if s_ == slot]
+            got = assign.get((hn, names[0])) if names else None
+            if got:
+                tp = got[0]
+                route = np.vstack([tp] + aims + [gc])
+                dist = float(np.sum(np.hypot(*np.diff(route, axis=0).T)))
+                totals[slot] += dist
+                hole["Tees"].append({"TeeType": slot, "Enabled": True, "Distance": round(dist, 3), "Position": P(tp)})
+            else:
+                hole["Tees"].append({"TeeType": slot, "Enabled": False, "Distance": 0.0, "Position": None})
+        for k in range(2):
+            hole["Tees"].append({"TeeType": "AimPoint%d" % (k + 1), "Enabled": k < len(aims), "Distance": 0.0,
+                                 "Position": P(aims[k]) if k < len(aims) else None})
+        hole["Tees"].append({"TeeType": "GreenCenterPoint", "Enabled": False, "Distance": 0.0, "Position": P(gc) if h else None})
+        for day, (ox, oz) in zip(days, offsets):
+            hole["Pins"].append({"Day": day, "Position": P(gc + np.array([ox, oz]))})
+        new_holes.append(hole)
+    d["Holes"] = new_holes
+    d["TeeTypeTotalDistance"] = [{"TeeType": s_, "Enabled": True, "Distance": round(totals[s_], 3), "Position": None} for s_ in GSP_SLOTS]
+    if "pOOB" in d:
+        d["pOOB"] = {"pointCount": 0, "coords": []}
+    out = c["name"] + ".GKD"
+    json.dump(d, open(out, "w"), separators=(",", ":"))
+    print("Wrote %s (tees, greens, aim points, 4 pins per green). Open it in Greenkeeper, check, then Save there." % out)
+
+
 SVG_LAYERS = [("Rough", "rough", "#278438"), ("Deep", "deep", "#164B20"), ("Fairway", "fairway", "#43E561"),
               ("Tee", "tee", "#A0E5B8"), ("Green", "green", "#BCE5A4"), ("Bunker", "bunker", "#E5E5AA"), ("Water", "water", "#0000C0")]
 
@@ -709,6 +890,9 @@ def main():
     p.add_argument("--spacing", type=float, default=3.0); p.add_argument("--buffer", type=float, default=200); p.add_argument("--gkd")
     p.add_argument("--course-margin", type=float, default=60, help="metres beyond the mapped course boundary to keep (-1 = ignore boundary)")
     p = sp.add_parser("osm"); p.add_argument("--paths-fallback", action="store_true", help="use footpaths if no golf=cartpath")
+    sp.add_parser("holes")
+    p = sp.add_parser("card"); p.add_argument("--template"); p.add_argument("--name")
+    p.add_argument("--map", type=lambda v: dict(kv.lower().split("=", 1) for kv in v.split(",")), help="e.g. grey=Green,gold=Yellow")
     p = sp.add_parser("svg"); p.add_argument("--res", type=float, default=0.5, help="metres per pixel when tracing")
     p.add_argument("--corridor", type=float, default=60, help="course width around hole lines if no boundary is mapped")
     p.add_argument("--fw-corridor", type=float, default=38, help="max distance of detected fairway from the hole line")
@@ -717,7 +901,7 @@ def main():
     p.add_argument("--min-area", type=float, default=25, help="drop pieces smaller than this (m2)")
     p.add_argument("--simplify", type=float, default=0.15, help="outline simplification (m)")
     a = ap.parse_args()
-    {"svg": cmd_svg, "osm": cmd_osm, "new": cmd_new, "lidar": cmd_lidar, "satellite": cmd_satellite, "heightmap": cmd_heightmap,
+    {"card": cmd_card, "holes": cmd_holes, "svg": cmd_svg, "osm": cmd_osm, "new": cmd_new, "lidar": cmd_lidar, "satellite": cmd_satellite, "heightmap": cmd_heightmap,
      "trees": cmd_trees, "brush": cmd_brush}[a.cmd](a)
 
 
